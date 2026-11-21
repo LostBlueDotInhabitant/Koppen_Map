@@ -82,7 +82,7 @@ json.dump(temp_flat.astype(float).round(2).tolist(), open("temperature.json", "w
 <section class="card"><h2>Draw the map</h2><canvas id="cD" width="360" height="180"></canvas>
 <div class="row"><select id="ly"></select><label>brush <input id="br" type="range" min="1" max="15" value="4"></label></div>
 <div class="row"><label>value <input id="val" type="range"> <b id="valv"></b></label></div>
-<div class="row"><label><input id="sy" type="checkbox" checked> keep land/ice fractions in step</label><label><input id="rs" type="checkbox"> restore present day</label><button id="reset" class="ghost">Reset map</button></div>
+<div class="row"><label><input id="sy" type="checkbox" checked> keep land/ice fractions in step (land follows altitude unless you paint land yourself)</label><label><input id="rs" type="checkbox"> restore present day</label><button id="reset" class="ghost">Reset map</button></div>
 <div id="s2" class="status">Loading…</div></section>
 <section class="card"><h2>Predicted temperature (°C)</h2><canvas id="cT2" width="360" height="180"></canvas>
 <div class="row"><label>CO₂ <input id="co" type="range"> <b id="cov"></b></label></div>
@@ -175,6 +175,7 @@ function readout(e){
 
 /* ===== Draw a map tab ===== */
 const LAY=[["alt","Altitude (m)",-9000,7000,2000],["ice","Ice thickness (m)",0,4500,2000],["land","Land fraction (%)",0,100,100],["icef","Ice fraction (%)",0,100,100]];
+const LM=new Uint8Array(N);   // 1 = land fraction set by hand: painting altitude no longer changes it
 let BASE=null,M=null,MODEL=null,PAD=[],VEC=null,REG=null,KO=null,T2=null,down=false;
 function show(n){$("tab1").hidden=n!==1;$("tab2").hidden=n!==2;$("b1").classList.toggle("on",n===1);$("b2").classList.toggle("on",n===2)}
 $("b1").onclick=()=>show(1);$("b2").onclick=()=>show(2);
@@ -232,14 +233,15 @@ function cellOf(e){const b=e.currentTarget.getBoundingClientRect();
 function stroke(e){if(!M)return;const[cx,rw]=cellOf(e),R=+$("br").value,l=LAY[+$("ly").value][0],v=+$("val").value,rs=$("rs").checked,sy=$("sy").checked;
   for(let dy=-R;dy<=R;dy++){const r=rw+dy;if(r<0||r>=H)continue;
     for(let dx=-R;dx<=R;dx++){if(dx*dx+dy*dy>R*R)continue;const i=r*W+(((cx+dx)%W)+W)%W;
-      if(rs){for(const k in M)M[k][i]=BASE[k][i];continue}
-      M[l][i]=v;if(sy){if(l==="alt")M.land[i]=v>0?100:0;if(l==="ice")M.icef[i]=v>0?100:0}}}
+      if(rs){for(const k in M)M[k][i]=BASE[k][i];LM[i]=0;continue}
+      M[l][i]=v;if(l==="land")LM[i]=1;
+      if(sy){if(l==="alt"&&!LM[i])M.land[i]=v>0?100:0;if(l==="ice")M.icef[i]=v>0?100:0}}}
   drawLayer()}
 const cD=$("cD");
 cD.addEventListener("pointerdown",e=>{down=true;cD.setPointerCapture(e.pointerId);stroke(e)});
 cD.addEventListener("pointermove",e=>{if(down)stroke(e)});
 cD.addEventListener("pointerup",()=>{if(down){down=false;mapChanged()}});
-$("reset").onclick=()=>{if(!BASE)return;for(const k in BASE)M[k]=BASE[k].slice();drawLayer();mapChanged()};
+$("reset").onclick=()=>{if(!BASE)return;for(const k in BASE)M[k]=BASE[k].slice();LM.fill(0);drawLayer();mapChanged()};
 function readout2(e){if(!M)return;const[c,r]=cellOf(e),i=r*W+c;
   $("readout2").textContent="lat "+(r-89.5).toFixed(1)+", lon "+(c-179.5).toFixed(1)+"  |  altitude "+Math.round(M.alt[i])+" m  |  ice "+Math.round(M.ice[i])+" m  |  temperature "+(T2?T2[i].toFixed(1)+" °C":"–")+"  |  Köppen "+(KO?KO[i]:"–")}
 ["cD","cT2","cK2"].forEach(id=>$(id).addEventListener("mousemove",readout2));
