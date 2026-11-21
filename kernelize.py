@@ -37,6 +37,38 @@ DEFAULT_KOPPEN_PERIODS = [(1900, 1900, 1930), (1931, 1931, 1960), (1961, 1961, 1
 _DATA_SOURCES = {"github_base_url": None, "temperature_directory": None, "cache_directory": "data_cache"}
 
 
+# Kernel / water-vector settings. Change them from outside with configure_kernel(); any function that takes
+# kernel_size accepts None, which means "use the value set here".
+_KERNEL_SETTINGS = {"kernel_size": 5, "water_vector_kernel_size": None, "include_water_vectors": True,
+                    "inverse_distance_power": 1, "water_inverse_distance_power": 2, "scale_east_west_by_cos_latitude": False}
+
+
+# ======================= kernel configuration =======================
+def configure_kernel(kernel_size=5, water_vector_kernel_size=None, include_water_vectors=True,
+                     inverse_distance_power=1, scale_east_west_by_cos_latitude=False,
+                     water_inverse_distance_power=2):
+    """Set the defaults used by every function below (each call sets ALL of them).
+    kernel_size: odd integer, width/height of the neighbourhood (3, 5, 7, ...).
+    water_vector_kernel_size: neighbourhood used for the water vectors; None = same as kernel_size.
+        (A larger window lets the vectors 'see' water further away than the kernel does.)
+    include_water_vectors: add the 12 water/ice vector columns to the features of both models.
+    water_inverse_distance_power: same idea, used only by the two water vector sets (default 2 = 1/distance**2).
+    inverse_distance_power: (ice vector) 1 -> second water vector weights each unit vector by 1/distance;
+        2 -> by 1/distance**2.
+    scale_east_west_by_cos_latitude: False -> distances in grid-pixel units (what you described);
+        True -> east-west offsets shrunk by cos(latitude), i.e. closer to true distances near the poles."""
+    assert kernel_size % 2 == 1, "kernel_size must be odd"
+    _KERNEL_SETTINGS.update(kernel_size=kernel_size, water_vector_kernel_size=water_vector_kernel_size,
+                            include_water_vectors=include_water_vectors,
+                            inverse_distance_power=inverse_distance_power,
+                            scale_east_west_by_cos_latitude=scale_east_west_by_cos_latitude,
+                            water_inverse_distance_power=water_inverse_distance_power)
+
+def _resolve_kernel_size(kernel_size):
+    """None -> the configured default."""
+    return _KERNEL_SETTINGS["kernel_size"] if kernel_size is None else kernel_size
+
+
 # ======================= data source configuration =======================
 def configure_data_sources(github_base_url=None, temperature_directory=None, cache_directory="data_cache"):
     """Tell the module where the data is.
@@ -198,26 +230,100 @@ def build_neighbourhood_features_for_every_pixel(grid, kernel_size):
     return windows.reshape(grid.shape[0], grid.shape[1], -1)                         # flatten k, k, ch
 
 
+# ======================= water vectors =======================
+def compute_vectors_toward_marked_pixels(marked_pixel_grid, kernel_size=None, inverse_distance_power=None,
+                                         scale_east_west_by_cos_latitude=None):
+    """For every pixel, summarise WHERE the marked pixels (marked_pixel_grid > 0, e.g. water) are around it
+    with two vectors. Returns (180, 360, 4):
+        [0, 1] unit-vector sum   (east, north): sum over marked pixels in the window of d / |d|
+        [2, 3] inverse-distance  (east, north): sum over marked pixels of (d / |d|) / |d|**power
+    d = displacement from the central pixel to the marked pixel (east = +, north = +); the central pixel
+    itself is excluded. The window wraps like the kernel does.
+    A (0, 0) vector means either no marked pixel in the window or perfectly balanced ones; the kernel columns
+    tell the model which."""
+    k = _resolve_kernel_size(_KERNEL_SETTINGS["water_vector_kernel_size"]) if kernel_size is None else kernel_size
+    power = _KERNEL_SETTINGS["inverse_distance_power"] if inverse_distance_power is None else inverse_distance_power
+    scale_ew = (_KERNEL_SETTINGS["scale_east_west_by_cos_latitude"] if scale_east_west_by_cos_latitude is None
+                else scale_east_west_by_cos_latitude)
+    assert k % 2 == 1, "water vector kernel size must be odd"
+    radius = k // 2
+    is_marked = (marked_pixel_grid > 0).astype(np.float32)                        # (180, 360), 1 = marked
+    padded = wrap_grid_across_edges_and_poles(is_marked[..., None], radius)[..., 0]
+    windows = sliding_window_view(padded, (k, k))                                  # (180, 360, k, k)
+    offsets = np.arange(-radius, radius + 1)
+    north_offset, east_offset = np.meshgrid(offsets, offsets, indexing="ij")       # window row i -> north offset
+    # displacement of every window cell from the centre, one (k, k) table per latitude row
+    cos_latitude = np.cos(np.deg2rad(np.arange(NUM_LAT_ROWS) - 89.5)) if scale_ew else np.ones(NUM_LAT_ROWS)
+    east = east_offset[None, :, :] * cos_latitude[:, None, None]                   # (180, k, k)
+    north = np.broadcast_to(north_offset[None, :, :], east.shape).astype(float)
+    distance = np.sqrt(east ** 2 + north ** 2)
+    is_centre = distance == 0
+    safe_distance = np.where(is_centre, 1.0, distance)                              # avoid dividing by 0 at the centre
+    unit_east = np.where(is_centre, 0.0, east / safe_distance)                      # d / |d|
+    unit_north = np.where(is_centre, 0.0, north / safe_distance)
+    weight = safe_distance ** -power                                                # 1 / |d|**power
+    # sum the weights over the window cells that are marked (einsum = weighted sum per pixel)
+    def weighted_sum(per_row_weights):
+        return np.einsum("rcij,rij->rc", windows, per_row_weights.astype(np.float32))
+    return np.stack([weighted_sum(unit_east), weighted_sum(unit_north),
+                     weighted_sum(unit_east * weight), weighted_sum(unit_north * weight)], axis=-1)
+
+
+def compute_water_vectors_for_every_pixel(land_fraction_grid, **options):
+    """Water vectors toward ALL water pixels (land fraction == 0), including water under ice (ice shelves).
+    Returns (180, 360, 4): unit-sum (east, north), inverse-distance-sum (east, north)."""
+    options.setdefault("inverse_distance_power", _KERNEL_SETTINGS["water_inverse_distance_power"])
+    return compute_vectors_toward_marked_pixels(land_fraction_grid == 0, **options)
+
+def compute_open_water_vectors_for_every_pixel(land_fraction_grid, ice_fraction_grid, **options):
+    """Same, but only toward ICE-FREE water: land fraction == 0 AND ice fraction == 0. Water under ice
+    (ice shelves) is ignored, as if it were neither land nor water. Returns (180, 360, 4)."""
+    options.setdefault("inverse_distance_power", _KERNEL_SETTINGS["water_inverse_distance_power"])
+    return compute_vectors_toward_marked_pixels((land_fraction_grid == 0) & (ice_fraction_grid == 0), **options)
+
+
+def compute_ice_vectors_for_every_pixel(ice_fraction_grid, **options):
+    """Same vectors, toward ice pixels (ice fraction > 0, i.e. land ice and ice shelves). Returns (180, 360, 4)."""
+    return compute_vectors_toward_marked_pixels(ice_fraction_grid > 0, **options)
+
+
 # ======================= feature builders (all 64,800 pixels, for training or prediction) ==========
+def _map_features_for_every_pixel(map_variables, kernel_size, extra_channel=None):
+    """Time-invariant part of the features: kernel columns, then (if enabled) 12 vector columns:
+    4 toward all water, 4 toward ice-free water, 4 toward ice.
+    extra_channel: optional (180, 360) grid (surface temperature) appended as a 5th kernel channel."""
+    kernel_size = _resolve_kernel_size(kernel_size)
+    channels = map_variables if extra_channel is None else np.concatenate(
+        [map_variables, extra_channel[..., None].astype(np.float32)], axis=-1)
+    columns = [build_neighbourhood_features_for_every_pixel(channels, kernel_size).reshape(NUM_PIXELS, -1)]
+    if _KERNEL_SETTINGS["include_water_vectors"]:
+        land_fraction, ice_fraction = map_variables[..., 2], map_variables[..., 3]   # channels 2 and 3
+        columns.append(compute_water_vectors_for_every_pixel(land_fraction).reshape(NUM_PIXELS, -1))
+        columns.append(compute_open_water_vectors_for_every_pixel(land_fraction, ice_fraction)
+                       .reshape(NUM_PIXELS, -1))
+        columns.append(compute_ice_vectors_for_every_pixel(ice_fraction).reshape(NUM_PIXELS, -1))
+    return np.hstack(columns)
+
 def make_temperature_regression_features(kernel_size, global_mean_temperature, co2_ppm, epoch="0ka",
                                          map_variables=None):
-    """Features for EVERY pixel (land + ocean), shape (64800, kernel_size**2 * 4 + 2).
-    Columns: kernel of [altitude, ice thickness, land fraction, ice fraction], then global temp, CO2.
+    """Features for EVERY pixel (land + ocean). kernel_size=None -> configured default.
+    Columns: kernel of [altitude, ice thickness, land fraction, ice fraction] (k*k*4),
+    the 12 vector columns (if enabled: 4 all-water, 4 ice-free-water, 4 ice), then global temp, CO2.
     Use epoch='21ka' (and 21 ka global temp / CO2) when predicting the past."""
     if map_variables is None:
         map_variables = load_time_invariant_map_variables(epoch)
-    kernels = build_neighbourhood_features_for_every_pixel(map_variables, kernel_size).reshape(NUM_PIXELS, -1)
+    kernels = _map_features_for_every_pixel(map_variables, kernel_size)
     # global temp and CO2 are the same for every pixel in a given year, and sit OUTSIDE the kernel
     global_columns = np.full((NUM_PIXELS, 2), [global_mean_temperature, co2_ppm], dtype=np.float32)
     return np.hstack([kernels, global_columns])
 
 def make_koppen_tree_features(kernel_size, surface_temperature_grid, epoch="0ka", map_variables=None):
-    """Features for EVERY pixel, shape (64800, kernel_size**2 * 5).
-    Columns: kernel of the 4 map variables plus surface temperature (all in one 5-channel kernel)."""
+    """Features for EVERY pixel. kernel_size=None -> configured default.
+    Columns: kernel of the 4 map variables plus surface temperature (one 5-channel kernel, k*k*5),
+    then the 12 vector columns (if enabled: 4 all-water, 4 ice-free-water, 4 ice)."""
     if map_variables is None:
         map_variables = load_time_invariant_map_variables(epoch)
-    five_channels = np.concatenate([map_variables, surface_temperature_grid[..., None].astype(np.float32)], -1)
-    return build_neighbourhood_features_for_every_pixel(five_channels, kernel_size).reshape(NUM_PIXELS, -1)
+    return _map_features_for_every_pixel(map_variables, kernel_size, extra_channel=surface_temperature_grid)
 
 
 # ======================= ready-to-train functions =======================
@@ -225,14 +331,15 @@ def make_temperature_regression_training_data(kernel_size, years, global_mean_te
                                               co2_ppm_by_year, local_temperature_grid_by_year,
                                               map_epoch="0ka", pixels_per_year=None, random_seed=0):
     """Returns (X, y) ready for model.fit(X, y). One sample per pixel per year (land + ocean).
+    kernel_size: odd int, or None to use the value set with configure_kernel().
     years: iterable of years. *_by_year: dicts {year: value} (grids are (180, 360)).
     pixels_per_year: if set, keep only this many RANDOM pixels from each year (different pixels every
         year, reproducible via random_seed). All 64,800 pixels x 200 years x 102 features is ~5 GB;
         5,000 per year is ~0.4 GB. Neighbouring pixels are near-duplicates, so little information is lost."""
     rng = np.random.default_rng(random_seed)
     map_variables = load_time_invariant_map_variables(map_epoch)
-    # kernels of the time-invariant maps are identical every year: compute once, reuse
-    kernels = build_neighbourhood_features_for_every_pixel(map_variables, kernel_size).reshape(NUM_PIXELS, -1)
+    # kernels (and water vectors) of the time-invariant maps are identical every year: compute once, reuse
+    kernels = _map_features_for_every_pixel(map_variables, kernel_size)
     X_parts, y_parts = [], []
     for year in years:
         kept_pixels = (np.arange(NUM_PIXELS) if pixels_per_year is None
@@ -263,7 +370,7 @@ def reshape_predictions_to_grid(flat_predictions):
 
 
 # ======================= one-call versions: load everything and return (X, y) =======================
-def make_temperature_regression_training_data_from_files(kernel_size, scenario="ssp245", years=range(1900, 2100),
+def make_temperature_regression_training_data_from_files(kernel_size=None, scenario="ssp245", years=range(1900, 2100),
                                                          pixels_per_year=None, global_temperature_from="file"):
     """Loads all data (GitHub + local temperature files) and returns (X, y) for model.fit.
     global_temperature_from: 'file' = global mean from the co2_temperature files;
@@ -276,7 +383,7 @@ def make_temperature_regression_training_data_from_files(kernel_size, scenario="
     return make_temperature_regression_training_data(kernel_size, years, global_temperature_by_year, co2_by_year,
                                                      local_grids, pixels_per_year=pixels_per_year)
 
-def make_koppen_tree_training_data_from_files(kernel_size, scenario="ssp245", periods=DEFAULT_KOPPEN_PERIODS):
+def make_koppen_tree_training_data_from_files(kernel_size=None, scenario="ssp245", periods=DEFAULT_KOPPEN_PERIODS):
     """Loads all data and returns (X, y) for model.fit. Temperature channel = mean over each Koppen period."""
     grids = load_local_temperature_grids_by_year(scenario, min(p[1] for p in periods), max(p[2] for p in periods))
     return make_koppen_tree_training_data(kernel_size, compute_period_mean_temperature_grids(grids, periods))
