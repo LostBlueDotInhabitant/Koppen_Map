@@ -43,14 +43,16 @@ _DATA_SOURCES = {"github_base_url": None, "temperature_directory": None, "cache_
 # kernel_size accepts None, which means "use the value set here".
 _KERNEL_SETTINGS = {"kernel_size": 5, "water_vector_kernel_size": None, "include_water_vectors": True,
                     "inverse_distance_power": 1, "water_inverse_distance_power": 2,
-                    "scale_east_west_by_cos_latitude": False}
+                    "scale_east_west_by_cos_latitude": False, "include_latitude": True}
 
 
 # ======================= kernel configuration =======================
 def configure_kernel(kernel_size=5, water_vector_kernel_size=None, include_water_vectors=True,
                      inverse_distance_power=1, scale_east_west_by_cos_latitude=False,
-                     water_inverse_distance_power=2):
+                     water_inverse_distance_power=2, include_latitude=True):
     """Set the defaults used by every function below (each call sets ALL of them).
+    include_latitude: add one latitude column (degrees, pixel centre) to the features of both models.
+        Longitude is never included.
     kernel_size: odd integer, width/height of the neighbourhood (3, 5, 7, ...).
     water_vector_kernel_size: neighbourhood used for the water AND ice vectors; None = same as kernel_size.
         (A larger window lets the vectors 'see' water/ice further away than the kernel does.)
@@ -66,7 +68,8 @@ def configure_kernel(kernel_size=5, water_vector_kernel_size=None, include_water
                             include_water_vectors=include_water_vectors,
                             inverse_distance_power=inverse_distance_power,
                             scale_east_west_by_cos_latitude=scale_east_west_by_cos_latitude,
-                            water_inverse_distance_power=water_inverse_distance_power)
+                            water_inverse_distance_power=water_inverse_distance_power,
+                            include_latitude=include_latitude)
 
 def _resolve_kernel_size(kernel_size):
     """None -> the configured default."""
@@ -320,7 +323,8 @@ def compute_ice_vectors_for_every_pixel(ice_fraction_grid, **options):
 # ======================= feature builders (all 64,800 pixels, for training or prediction) ==========
 def _map_features_for_every_pixel(map_variables, kernel_size, extra_channel=None):
     """Time-invariant part of the features: kernel columns, then (if enabled) 12 vector columns:
-    4 toward all water, 4 toward ice-free water, 4 toward ice (each set = unweighted pair + 1/d**2 pair).
+    4 toward all water, 4 toward ice-free water, 4 toward ice (each set = unweighted pair + 1/d**2 pair),
+    then (if include_latitude) 1 latitude column. Longitude is never a feature.
     extra_channel: optional (180, 360) grid (surface temperature) appended as a 5th kernel channel."""
     kernel_size = _resolve_kernel_size(kernel_size)
     channels = map_variables if extra_channel is None else np.concatenate(
@@ -332,6 +336,10 @@ def _map_features_for_every_pixel(map_variables, kernel_size, extra_channel=None
         columns.append(compute_open_water_vectors_for_every_pixel(land_fraction, ice_fraction)
                        .reshape(NUM_PIXELS, -1))
         columns.append(compute_ice_vectors_for_every_pixel(ice_fraction).reshape(NUM_PIXELS, -1))
+    if _KERNEL_SETTINGS["include_latitude"]:
+        # one column: latitude (degrees) of each pixel centre; flattened row-major like the other columns
+        latitude_of_row = np.arange(NUM_LAT_ROWS, dtype=np.float32) - 89.5
+        columns.append(np.repeat(latitude_of_row, NUM_LON_COLS).reshape(NUM_PIXELS, 1))
     return np.hstack(columns)
 
 def make_temperature_regression_features(kernel_size, global_mean_temperature, co2_ppm, epoch="0ka",
