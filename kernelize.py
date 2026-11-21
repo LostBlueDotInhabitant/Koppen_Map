@@ -29,6 +29,8 @@ NUM_PIXELS = NUM_LAT_ROWS * NUM_LON_COLS
 LOCAL_HISTORICAL_TEMPERATURE_FILE = "tas_annual_mean_1deg_wide_celsius.csv"
 LOCAL_SCENARIO_TEMPERATURE_FILE = "temp_annual_all_scenarios_2015_2099.csv"
 
+ALL_SCENARIOS = ("ssp119", "ssp126", "ssp245", "ssp370", "ssp434", "ssp460", "ssp585")
+
 # Koppen labels only change every 30 years, so there are 4 distinct label maps in 1900-2026.
 # Each entry: (year whose Koppen label to use, first year, last year of the period to average temperature over)
 DEFAULT_KOPPEN_PERIODS = [(1900, 1900, 1930), (1931, 1931, 1960), (1961, 1961, 1990), (1991, 1991, 2020)]
@@ -37,10 +39,11 @@ DEFAULT_KOPPEN_PERIODS = [(1900, 1900, 1930), (1931, 1931, 1960), (1961, 1961, 1
 _DATA_SOURCES = {"github_base_url": None, "temperature_directory": None, "cache_directory": "data_cache"}
 
 
-# Kernel / water-vector settings. Change them from outside with configure_kernel(); any function that takes
+# Kernel / vector settings. Change them from outside with configure_kernel(); any function that takes
 # kernel_size accepts None, which means "use the value set here".
 _KERNEL_SETTINGS = {"kernel_size": 5, "water_vector_kernel_size": None, "include_water_vectors": True,
-                    "inverse_distance_power": 1, "water_inverse_distance_power": 2, "scale_east_west_by_cos_latitude": False}
+                    "inverse_distance_power": 1, "water_inverse_distance_power": 2,
+                    "scale_east_west_by_cos_latitude": False}
 
 
 # ======================= kernel configuration =======================
@@ -49,13 +52,14 @@ def configure_kernel(kernel_size=5, water_vector_kernel_size=None, include_water
                      water_inverse_distance_power=2):
     """Set the defaults used by every function below (each call sets ALL of them).
     kernel_size: odd integer, width/height of the neighbourhood (3, 5, 7, ...).
-    water_vector_kernel_size: neighbourhood used for the water vectors; None = same as kernel_size.
-        (A larger window lets the vectors 'see' water further away than the kernel does.)
+    water_vector_kernel_size: neighbourhood used for the water AND ice vectors; None = same as kernel_size.
+        (A larger window lets the vectors 'see' water/ice further away than the kernel does.)
     include_water_vectors: add the 12 water/ice vector columns to the features of both models.
-    water_inverse_distance_power: same idea, used only by the two water vector sets (default 2 = 1/distance**2).
-    inverse_distance_power: (ice vector) 1 -> second water vector weights each unit vector by 1/distance;
-        2 -> by 1/distance**2.
-    scale_east_west_by_cos_latitude: False -> distances in grid-pixel units (what you described);
+    water_inverse_distance_power: power of the distance-weighted vector in the water AND ice vector sets
+        (default 2 = 1/distance**2). The other vector of each set is not weighted by distance (power 0).
+    inverse_distance_power: fallback power used only when compute_vectors_toward_marked_pixels is called
+        directly without a power. Not used by the water or ice vectors.
+    scale_east_west_by_cos_latitude: False -> distances in grid-pixel units;
         True -> east-west offsets shrunk by cos(latitude), i.e. closer to true distances near the poles."""
     assert kernel_size % 2 == 1, "kernel_size must be odd"
     _KERNEL_SETTINGS.update(kernel_size=kernel_size, water_vector_kernel_size=water_vector_kernel_size,
@@ -179,7 +183,7 @@ def _wide_table_to_grids_by_year(table, years):
     return grids_by_year
 
 def load_local_temperature_grids_by_year(scenario="ssp245", first_year=1900, last_year=2099):
-    """{year: (180, 360) local annual mean temperature in C}.
+    """{year: (180, 360) local annual mean temperature in C} for ONE scenario.
     1900-2014 come from the historical file, 2015-2099 from the chosen scenario (2015 is the first
     scenario year, so the scenario only matters from 2015)."""
     grids_by_year = {}
@@ -199,6 +203,28 @@ def load_local_temperature_grids_by_year(scenario="ssp245", first_year=1900, las
             raise ValueError(f"Scenario '{scenario}' not found in the scenario temperature file")
         grids_by_year.update(_wide_table_to_grids_by_year(pd.concat(kept_chunks), scenario_years))
     return grids_by_year
+
+def load_all_local_temperature_grids(scenarios=ALL_SCENARIOS, first_year=1900, last_year=2099):
+    """Returns (historical_grids {year: grid} for years <= 2014, scenario_grids {scenario: {year: grid}} for
+    years >= 2015). The big scenario file is read ONCE for all the requested scenarios."""
+    historical_grids = {}
+    if first_year <= 2014:
+        historical_years = range(first_year, min(last_year, 2014) + 1)
+        historical = pd.read_csv(_path_of_local_temperature_file(LOCAL_HISTORICAL_TEMPERATURE_FILE))
+        historical_grids = _wide_table_to_grids_by_year(historical, historical_years)
+    scenario_grids = {}
+    scenario_years = list(range(max(first_year, 2015), last_year + 1))
+    if scenario_years:
+        for chunk in pd.read_csv(_path_of_local_temperature_file(LOCAL_SCENARIO_TEMPERATURE_FILE),
+                                 chunksize=NUM_PIXELS,
+                                 usecols=["scenario", "lat", "lon"] + [str(y) for y in scenario_years]):
+            name = chunk["scenario"].iloc[0]
+            if name in scenarios:
+                scenario_grids[name] = _wide_table_to_grids_by_year(chunk, scenario_years)
+        missing = set(scenarios) - set(scenario_grids)
+        if missing:
+            raise ValueError(f"Scenarios not found in the scenario temperature file: {sorted(missing)}")
+    return historical_grids, scenario_grids
 
 def compute_period_mean_temperature_grids(local_temperature_grids_by_year, periods=DEFAULT_KOPPEN_PERIODS):
     """Average the yearly grids over each Koppen period.
@@ -230,12 +256,13 @@ def build_neighbourhood_features_for_every_pixel(grid, kernel_size):
     return windows.reshape(grid.shape[0], grid.shape[1], -1)                         # flatten k, k, ch
 
 
-# ======================= water vectors =======================
+# ======================= water and ice vectors =======================
 def compute_vectors_toward_marked_pixels(marked_pixel_grid, kernel_size=None, inverse_distance_power=None,
                                          scale_east_west_by_cos_latitude=None):
-    """For every pixel, summarise WHERE the marked pixels (marked_pixel_grid > 0, e.g. water) are around it
-    with two vectors. Returns (180, 360, 4):
+    """For every pixel, summarise WHERE the marked pixels (marked_pixel_grid > 0, e.g. water or ice) are
+    around it with two vectors. Returns (180, 360, 4):
         [0, 1] unit-vector sum   (east, north): sum over marked pixels in the window of d / |d|
+               (no distance weighting, i.e. power 0)
         [2, 3] inverse-distance  (east, north): sum over marked pixels of (d / |d|) / |d|**power
     d = displacement from the central pixel to the marked pixel (east = +, north = +); the central pixel
     itself is excluded. The window wraps like the kernel does.
@@ -245,7 +272,7 @@ def compute_vectors_toward_marked_pixels(marked_pixel_grid, kernel_size=None, in
     power = _KERNEL_SETTINGS["inverse_distance_power"] if inverse_distance_power is None else inverse_distance_power
     scale_ew = (_KERNEL_SETTINGS["scale_east_west_by_cos_latitude"] if scale_east_west_by_cos_latitude is None
                 else scale_east_west_by_cos_latitude)
-    assert k % 2 == 1, "water vector kernel size must be odd"
+    assert k % 2 == 1, "vector kernel size must be odd"
     radius = k // 2
     is_marked = (marked_pixel_grid > 0).astype(np.float32)                        # (180, 360), 1 = marked
     padded = wrap_grid_across_edges_and_poles(is_marked[..., None], radius)[..., 0]
@@ -271,7 +298,8 @@ def compute_vectors_toward_marked_pixels(marked_pixel_grid, kernel_size=None, in
 
 def compute_water_vectors_for_every_pixel(land_fraction_grid, **options):
     """Water vectors toward ALL water pixels (land fraction == 0), including water under ice (ice shelves).
-    Returns (180, 360, 4): unit-sum (east, north), inverse-distance-sum (east, north)."""
+    Returns (180, 360, 4): unit-sum (east, north) [no distance weighting],
+    inverse-distance-sum (east, north) [1/distance**water_inverse_distance_power, default 2]."""
     options.setdefault("inverse_distance_power", _KERNEL_SETTINGS["water_inverse_distance_power"])
     return compute_vectors_toward_marked_pixels(land_fraction_grid == 0, **options)
 
@@ -281,16 +309,18 @@ def compute_open_water_vectors_for_every_pixel(land_fraction_grid, ice_fraction_
     options.setdefault("inverse_distance_power", _KERNEL_SETTINGS["water_inverse_distance_power"])
     return compute_vectors_toward_marked_pixels((land_fraction_grid == 0) & (ice_fraction_grid == 0), **options)
 
-
 def compute_ice_vectors_for_every_pixel(ice_fraction_grid, **options):
-    """Same vectors, toward ice pixels (ice fraction > 0, i.e. land ice and ice shelves). Returns (180, 360, 4)."""
+    """Ice vectors toward ice pixels (ice fraction > 0, i.e. land ice and ice shelves), built exactly like the
+    water vectors: unit-sum (east, north) with no distance weighting, and inverse-distance-sum (east, north)
+    weighted by 1/distance**water_inverse_distance_power (default 2). Returns (180, 360, 4)."""
+    options.setdefault("inverse_distance_power", _KERNEL_SETTINGS["water_inverse_distance_power"])
     return compute_vectors_toward_marked_pixels(ice_fraction_grid > 0, **options)
 
 
 # ======================= feature builders (all 64,800 pixels, for training or prediction) ==========
 def _map_features_for_every_pixel(map_variables, kernel_size, extra_channel=None):
     """Time-invariant part of the features: kernel columns, then (if enabled) 12 vector columns:
-    4 toward all water, 4 toward ice-free water, 4 toward ice.
+    4 toward all water, 4 toward ice-free water, 4 toward ice (each set = unweighted pair + 1/d**2 pair).
     extra_channel: optional (180, 360) grid (surface temperature) appended as a 5th kernel channel."""
     kernel_size = _resolve_kernel_size(kernel_size)
     channels = map_variables if extra_channel is None else np.concatenate(
@@ -329,17 +359,21 @@ def make_koppen_tree_features(kernel_size, surface_temperature_grid, epoch="0ka"
 # ======================= ready-to-train functions =======================
 def make_temperature_regression_training_data(kernel_size, years, global_mean_temperature_by_year,
                                               co2_ppm_by_year, local_temperature_grid_by_year,
-                                              map_epoch="0ka", pixels_per_year=None, random_seed=0):
+                                              map_epoch="0ka", pixels_per_year=None, random_seed=0,
+                                              precomputed_kernels=None):
     """Returns (X, y) ready for model.fit(X, y). One sample per pixel per year (land + ocean).
     kernel_size: odd int, or None to use the value set with configure_kernel().
     years: iterable of years. *_by_year: dicts {year: value} (grids are (180, 360)).
     pixels_per_year: if set, keep only this many RANDOM pixels from each year (different pixels every
         year, reproducible via random_seed). All 64,800 pixels x 200 years x 102 features is ~5 GB;
-        5,000 per year is ~0.4 GB. Neighbouring pixels are near-duplicates, so little information is lost."""
+        5,000 per year is ~0.4 GB. Neighbouring pixels are near-duplicates, so little information is lost.
+    precomputed_kernels: optional output of _map_features_for_every_pixel, to avoid recomputing it."""
     rng = np.random.default_rng(random_seed)
-    map_variables = load_time_invariant_map_variables(map_epoch)
-    # kernels (and water vectors) of the time-invariant maps are identical every year: compute once, reuse
-    kernels = _map_features_for_every_pixel(map_variables, kernel_size)
+    if precomputed_kernels is None:
+        map_variables = load_time_invariant_map_variables(map_epoch)
+        # kernels (and vectors) of the time-invariant maps are identical every year: compute once, reuse
+        precomputed_kernels = _map_features_for_every_pixel(map_variables, kernel_size)
+    kernels = precomputed_kernels
     X_parts, y_parts = [], []
     for year in years:
         kept_pixels = (np.arange(NUM_PIXELS) if pixels_per_year is None
@@ -369,21 +403,57 @@ def reshape_predictions_to_grid(flat_predictions):
     return np.asarray(flat_predictions).reshape(NUM_LAT_ROWS, NUM_LON_COLS)
 
 
-# ======================= one-call versions: load everything and return (X, y) =======================
-def make_temperature_regression_training_data_from_files(kernel_size=None, scenario="ssp245", years=range(1900, 2100),
-                                                         pixels_per_year=None, global_temperature_from="file"):
-    """Loads all data (GitHub + local temperature files) and returns (X, y) for model.fit.
+# ======================= one-call versions: load everything and return the data =======================
+def make_temperature_regression_training_data_from_files(kernel_size=None, scenarios=ALL_SCENARIOS,
+                                                         years=range(1900, 2100), pixels_per_year=None,
+                                                         global_temperature_from="file", random_seed=0):
+    """Loads all data (GitHub + local temperature files) and returns (X, y, year_of_row, scenario_of_row)
+    covering ALL the scenarios stacked together.
+    Historical years (<= 2014) are included once (scenario_of_row = 'historical'); every scenario contributes
+    its own 2015+ years. Then split into train/test by picking random rows (random_train_test_split).
+    scenarios: default = all 7 SSP scenarios.
+    pixels_per_year: random pixels kept per year (a different random sample for every scenario and year).
     global_temperature_from: 'file' = global mean from the co2_temperature files;
                              'grid' = area-weighted mean of the local grids (self-consistent)."""
-    years = list(years)
-    global_temperature_by_year, co2_by_year = load_global_mean_temperature_and_co2_by_year(scenario, max(years))
-    local_grids = load_local_temperature_grids_by_year(scenario, min(years), max(years))
-    if global_temperature_from == "grid":
-        global_temperature_by_year = {y: compute_area_weighted_global_mean(local_grids[y]) for y in years}
-    return make_temperature_regression_training_data(kernel_size, years, global_temperature_by_year, co2_by_year,
-                                                     local_grids, pixels_per_year=pixels_per_year)
+    years, scenarios = list(years), list(scenarios)
+    historical_years = [y for y in years if y <= 2014]
+    future_years = [y for y in years if y >= 2015]
+    historical_grids, scenario_grids = load_all_local_temperature_grids(scenarios, min(years), max(years))
+    # the time-invariant kernels and vectors are the same for every scenario: compute once
+    kernels = _map_features_for_every_pixel(load_time_invariant_map_variables("0ka"), kernel_size)
+    rows_per_year = NUM_PIXELS if pixels_per_year is None else pixels_per_year
+    X_parts, y_parts, year_parts, scenario_parts = [], [], [], []
+    for i, scenario in enumerate(scenarios):
+        run_years = (historical_years if i == 0 else []) + future_years     # historical years only once
+        if not run_years:
+            continue
+        grids = {**historical_grids, **scenario_grids.get(scenario, {})}
+        temperature_by_year, co2_by_year = load_global_mean_temperature_and_co2_by_year(scenario, max(years))
+        if global_temperature_from == "grid":
+            temperature_by_year = {y: compute_area_weighted_global_mean(grids[y]) for y in run_years}
+        X, y = make_temperature_regression_training_data(
+            kernel_size, run_years, temperature_by_year, co2_by_year, grids,
+            pixels_per_year=pixels_per_year, random_seed=random_seed + i, precomputed_kernels=kernels)
+        year_of_row = np.repeat(run_years, rows_per_year)
+        X_parts.append(X)
+        y_parts.append(y)
+        year_parts.append(year_of_row)
+        scenario_parts.append(np.where(year_of_row <= 2014, "historical", scenario))
+    return (np.vstack(X_parts), np.concatenate(y_parts),
+            np.concatenate(year_parts), np.concatenate(scenario_parts))
 
 def make_koppen_tree_training_data_from_files(kernel_size=None, scenario="ssp245", periods=DEFAULT_KOPPEN_PERIODS):
     """Loads all data and returns (X, y) for model.fit. Temperature channel = mean over each Koppen period."""
     grids = load_local_temperature_grids_by_year(scenario, min(p[1] for p in periods), max(p[2] for p in periods))
     return make_koppen_tree_training_data(kernel_size, compute_period_mean_temperature_grids(grids, periods))
+
+def random_train_test_split(X, y, test_fraction=0.2, random_seed=0, *extra_row_arrays):
+    """Randomly splits rows into train and test. Returns X_train, y_train, X_test, y_test, then
+    (train, test) pairs for each extra per-row array passed in (e.g. year_of_row, scenario_of_row)."""
+    order = np.random.default_rng(random_seed).permutation(len(y))
+    n_test = int(len(y) * test_fraction)
+    test, train = order[:n_test], order[n_test:]
+    result = [X[train], y[train], X[test], y[test]]
+    for extra in extra_row_arrays:
+        result += [extra[train], extra[test]]
+    return tuple(result)
