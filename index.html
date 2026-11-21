@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Koppen Map</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);
+--bg:#fafaf7;--fg:#1c1c1a;--mut:#6b6b66;--card:#fff;--bd:#dcdcd4;--acc:#2a6f97;--map:#e8e8e2;color-scheme:light}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#161615;--fg:#ecece6;--mut:#9a9a92;--card:#201f1e;--bd:#3a3936;--acc:#7cc0e6;--map:#2b2a28;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#161615;--fg:#ecece6;--mut:#9a9a92;--card:#201f1e;--bd:#3a3936;--acc:#7cc0e6;--map:#2b2a28;color-scheme:dark}
+*,*::before,*::after{box-sizing:inherit}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:1200px;margin:0 auto;padding:20px 16px 40px}
+h1{font-size:22px;margin:0 0 4px}
+p.sub{margin:0 0 16px;color:var(--mut)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:14px;min-width:0}
+.card h2{font-size:16px;margin:0 0 8px}
+canvas{width:100%;aspect-ratio:2/1;display:block;image-rendering:pixelated;background:var(--map);border-radius:6px;cursor:crosshair}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px}
+.status{color:var(--mut);font-size:13px;min-height:1.3em;margin-top:6px}
+.err{color:#c0392b}
+button{font:inherit;font-size:14px;background:var(--acc);color:#fff;border:0;border-radius:8px;padding:6px 12px;cursor:pointer}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) button{color:#10202b}}
+button.ghost{background:transparent;color:var(--acc);border:1px solid var(--bd)}
+input[type=number]{width:84px;font:inherit;font-size:14px;padding:4px 6px;border:1px solid var(--bd);border-radius:6px;background:var(--bg);color:var(--fg)}
+#legend{display:flex;flex-wrap:wrap;gap:4px 10px;margin-top:10px;font-size:13px}
+#legend span{display:inline-flex;align-items:center;gap:5px}
+#legend i{width:12px;height:12px;border-radius:3px;display:inline-block;border:1px solid var(--bd)}
+#bar{height:12px;border-radius:6px;margin-top:10px;border:1px solid var(--bd)}
+#barlab{display:flex;justify-content:space-between;font-size:12px;color:var(--mut)}
+#readout{margin:14px 0 0;padding:10px 12px;background:var(--card);border:1px solid var(--bd);border-radius:10px;font-variant-numeric:tabular-nums}
+details{margin-top:16px;color:var(--mut);font-size:14px}
+pre{overflow-x:auto;background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:10px;color:var(--fg);font-size:13px}
+</style>
+</head>
+<body>
+<main>
+<h1>Climate model viewer</h1>
+<p class="sub">A temporary page for looking at the Köppen tree’s predictions and the temperature regression’s predictions. The predictions are loaded automatically from koppen.json and temperature.json, which sit next to this page in the repository.</p>
+<div class="row" style="margin:0 0 14px"><button id="demo" class="ghost">Load demo data</button></div>
+<div class="grid">
+  <section class="card">
+    <h2>Köppen decision tree</h2>
+    <canvas id="cK" width="360" height="180"></canvas>
+        <div id="sK" class="status">Loading…</div>
+    <div id="legend"></div>
+  </section>
+  <section class="card">
+    <h2>Temperature regression (°C)</h2>
+    <canvas id="cT" width="360" height="180"></canvas>
+    <div class="row"><span>min</span><input id="mn" type="number" step="1"><span>max</span><input id="mx" type="number" step="1">
+      <button id="auto" class="ghost">Auto range</button></div>
+    <div id="sT" class="status">Loading…</div>
+    <div id="bar"></div><div id="barlab"><span id="l0"></span><span id="l1"></span></div>
+  </section>
+</div>
+<div id="readout">Hover a map to read a pixel.</div>
+<details><summary>File format and how to update the maps</summary>
+<p>Commit <code>koppen.json</code> and <code>temperature.json</code> in the same folder as this page; they are fetched on load. Each file holds 64,800 values (a JSON list, or numbers/labels separated by commas or newlines), in the same order as <code>reshape_predictions_to_grid</code> expects: row-major, rows from south to north, columns from longitude −180 to 180. Empty, null or NaN values are drawn as blank. Köppen labels such as “Cfb” get the standard Köppen colours; any other labels get generated colours.</p>
+<pre>import json
+json.dump(koppen_flat.tolist(), open("koppen.json", "w"))                       # tree.predict(...), shape (64800,)
+json.dump(temp_flat.astype(float).round(2).tolist(), open("temperature.json", "w"))  # regression .predict(...)</pre>
+</details>
+</main>
+<script>
+const W=360,H=180,N=W*H;
+const KC={Af:"#0000fe",Am:"#0077fd",Aw:"#46a9fa",BWh:"#fe0000",BWk:"#fe9695",BSh:"#f5a301",BSk:"#ffdb63",Csa:"#ffff00",Csb:"#c6c700",Csc:"#969600",Cwa:"#96ff96",Cwb:"#63c764",Cwc:"#329633",Cfa:"#c6ff4e",Cfb:"#66ff33",Cfc:"#33c701",Dsa:"#ff00fe",Dsb:"#c600c7",Dsc:"#963295",Dsd:"#966495",Dwa:"#abb1ff",Dwb:"#5a77db",Dwc:"#4c51b5",Dwd:"#320087",Dfa:"#00ffff",Dfb:"#38c7ff",Dfc:"#007e7d",Dfd:"#00455e",ET:"#b2b2b2",EF:"#666666"};
+const STOPS=["#313695","#4575b4","#74add1","#abd9e9","#e0f3f8","#ffffbf","#fee090","#fdae61","#f46d43","#d73027","#a50026"].map(h=>[1,3,5].map(i=>parseInt(h.slice(i,i+2),16)));
+const $=id=>document.getElementById(id);
+const S={k:null,t:null};
+function hex(h){return[1,3,5].map(i=>parseInt(h.slice(i,i+2),16))}
+function ramp(x){x=Math.min(1,Math.max(0,x))*(STOPS.length-1);const i=Math.min(STOPS.length-2,Math.floor(x)),f=x-i;return STOPS[i].map((v,j)=>Math.round(v+(STOPS[i+1][j]-v)*f))}
+function blank(v){return v===null||v===undefined||v===""||(typeof v==="number"&&!isFinite(v))||v==="NaN"||v==="nan"}
+function parse(text){
+  text=text.trim();let a;
+  if(text[0]==="["){a=JSON.parse(text)}
+  else if(text[0]==="{"){const o=JSON.parse(text);a=o.values||o.data||Object.values(o)[0]}
+  else{a=text.split(/[\s,;]+/).filter(s=>s.length).map(s=>(s!==""&&!isNaN(+s))?+s:s)}
+  if(!Array.isArray(a)||a.length!==N)throw new Error("Expected "+N+" values, found "+(Array.isArray(a)?a.length:0)+".");
+  return a;
+}
+function paint(canvas,colorOf){
+  const ctx=canvas.getContext("2d"),img=ctx.createImageData(W,H);
+  for(let r=0;r<H;r++)for(let c=0;c<W;c++){
+    const rgb=colorOf(r*W+c),p=((H-1-r)*W+c)*4;     // row 0 = south, so flip to put north at the top
+    if(rgb){img.data[p]=rgb[0];img.data[p+1]=rgb[1];img.data[p+2]=rgb[2];img.data[p+3]=255}
+  }
+  ctx.putImageData(img,0,0);
+}
+function drawK(){
+  const a=S.k;if(!a)return;
+  const labels=[...new Set(a.filter(v=>!blank(v)))].sort(),cmap={};
+  labels.forEach((l,i)=>{cmap[l]=KC[l]?hex(KC[l]):hslToRgb((i*137.5)%360,.65,.55)});
+  paint($("cK"),i=>blank(a[i])?null:cmap[a[i]]);
+  $("legend").innerHTML=labels.map(l=>"<span><i style=\"background:rgb("+cmap[l].join(",")+")\"></i>"+l+"</span>").join("");
+}
+function hslToRgb(h,s,l){const k=n=>(n+h/30)%12,a=s*Math.min(l,1-l),f=n=>l-a*Math.max(-1,Math.min(k(n)-3,Math.min(9-k(n),1)));return[Math.round(255*f(0)),Math.round(255*f(8)),Math.round(255*f(4))]}
+function drawT(){
+  const a=S.t;if(!a)return;
+  const lo=parseFloat($("mn").value),hi=parseFloat($("mx").value);
+  paint($("cT"),i=>blank(a[i])||typeof a[i]!=="number"?null:ramp((a[i]-lo)/(hi-lo||1)));
+  $("bar").style.background="linear-gradient(90deg,"+STOPS.map(s=>"rgb("+s.join(",")+")").join(",")+")";
+  $("l0").textContent=lo.toFixed(1)+" °C";$("l1").textContent=hi.toFixed(1)+" °C";
+}
+function autoRange(){
+  const v=S.t.filter(x=>typeof x==="number"&&isFinite(x)).sort((x,y)=>x-y);
+  $("mn").value=Math.floor(v[Math.floor(v.length*.005)]);$("mx").value=Math.ceil(v[Math.floor(v.length*.995)]);
+}
+async function autoLoad(){
+  for(const [file,kind,status] of [["koppen.json","k",$("sK")],["temperature.json","t",$("sT")]]){
+    try{
+      const r=await fetch(file,{cache:"no-cache"});
+      if(!r.ok)throw new Error("not found next to this page (HTTP "+r.status+").");
+      const a=parse(await r.text());
+      if(kind==="k"){S.k=a;drawK()}else{
+        if(a.some(v=>!blank(v)&&typeof v!=="number"))throw new Error("contains non-numeric values.");
+        S.t=a;autoRange();drawT()}
+      status.className="status";status.textContent=file+" loaded.";
+    }catch(e){status.className="status err";status.textContent=file+": "+e.message}
+  }
+}
+autoLoad();
+["mn","mx"].forEach(id=>$(id).addEventListener("input",drawT));
+$("auto").addEventListener("click",()=>{if(S.t){autoRange();drawT()}});
+$("demo").addEventListener("click",()=>{
+  const t=new Array(N),k=new Array(N);
+  for(let r=0;r<H;r++)for(let c=0;c<W;c++){
+    const lat=r-89.5,i=r*W+c,x=Math.abs(lat);
+    const v=28*Math.cos(lat*Math.PI/180)-12*Math.pow(x/90,2)-8+3*Math.sin(c/20)*Math.cos(r/15);
+    t[i]=+v.toFixed(2);
+    k[i]=x<10?"Af":x<18?"Aw":x<30?"BWh":x<38?"Csa":x<48?"Cfb":x<58?"Dfb":x<68?"Dfc":x<78?"ET":"EF";
+  }
+  S.t=t;S.k=k;autoRange();drawT();drawK();
+  $("sK").className=$("sT").className="status";$("sK").textContent=$("sT").textContent="Demo data (synthetic, not model output).";
+});
+function readout(e){
+  const cv=e.currentTarget,b=cv.getBoundingClientRect();
+  const c=Math.min(W-1,Math.max(0,Math.floor((e.clientX-b.left)/b.width*W)));
+  const y=Math.min(H-1,Math.max(0,Math.floor((e.clientY-b.top)/b.height*H))),r=H-1-y,i=r*W+c;
+  const kv=S.k?S.k[i]:"–",tv=S.t&&typeof S.t[i]==="number"?S.t[i].toFixed(2)+" °C":"–";
+  $("readout").textContent="lat "+(r-89.5).toFixed(1)+", lon "+(c-179.5).toFixed(1)+"  |  Köppen: "+(blank(kv)?"–":kv)+"  |  temperature: "+tv;
+}
+["cK","cT"].forEach(id=>$(id).addEventListener("mousemove",readout));
+</script>
+</body>
+</html>
