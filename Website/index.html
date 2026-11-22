@@ -186,7 +186,20 @@ $("b1").onclick=()=>show(1);$("b2").onclick=()=>show(2);
 $("ly").innerHTML=LAY.map((l,i)=>"<option value=\""+i+"\">"+l[1]+"</option>").join("");
 function setLayer(){const l=LAY[+$("ly").value],v=$("val");v.min=l[2];v.max=l[3];v.value=l[4];$("valv").textContent=v.value;drawLayer()}
 $("ly").onchange=setLayer;$("val").oninput=()=>$("valv").textContent=$("val").value;
-function drawLayer(){if(!M)return;const l=LAY[+$("ly").value],a=M[l[0]];paint($("cD"),i=>ramp((a[i]-l[2])/(l[3]-l[2])))}
+function drawLayer(){
+  if(!M)return;
+  const l=LAY[+$("ly").value],a=M[l[0]];
+  if(l[0]==="alt"){
+    // land (>0) beige, ocean (≤0) blue
+    paint($("cD"),i=>{
+      const v=a[i];
+      if(blank(v))return null;
+      return v>0 ? [210,180,140] : [30,90,180];
+    });
+  }else{
+    paint($("cD"),i=>ramp((a[i]-l[2])/(l[3]-l[2])));
+  }
+}
 // pad a (H,W) array like kernelize.wrap_grid_across_edges_and_poles: wrap longitude, cross a pole = same row, +180 degrees
 function pad(a,p){const Wp=W+2*p,o=new Float32Array((H+2*p)*Wp);
   for(let R=-p;R<H+p;R++){let r=R,sh=0;if(r<0){r=-r-1;sh=180}else if(r>=H){r=2*H-1-r;sh=180}
