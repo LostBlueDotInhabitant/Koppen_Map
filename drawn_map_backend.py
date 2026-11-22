@@ -60,7 +60,7 @@ def predict_from_map_variables(map_variables, regressor, tree, global_mean_tempe
 
 # ======================= the server =======================
 def run_server(regressor=None, tree=None, site_folder=".", port=8000, kernel_size=None, save_directory="drawn_maps",
-               co2_slider=(180, 1300, 420), temperature_slider=(10, 22, 14.5), block=True,
+               co2_slider=(100, 1300, 420), temperature_slider=(4, 22, 14.5), block=True,
                allowed_origins=("https://lostbluedotinhabitant.github.io",)):
     """Serve the website (index.html, mapvariables.json, ... from site_folder) and the two endpoints above.
     regressor / tree may be left out (None): drawing-only mode. Every stroke is still saved to latest.npz,
