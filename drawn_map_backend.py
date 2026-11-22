@@ -60,7 +60,8 @@ def predict_from_map_variables(map_variables, regressor, tree, global_mean_tempe
 
 # ======================= the server =======================
 def run_server(regressor=None, tree=None, site_folder=".", port=8000, kernel_size=None, save_directory="drawn_maps",
-               co2_slider=(180, 1300, 420), temperature_slider=(10, 22, 14.5), block=True):
+               co2_slider=(180, 1300, 420), temperature_slider=(10, 22, 14.5), block=True,
+               allowed_origins=("https://lostbluedotinhabitant.github.io",)):
     """Serve the website (index.html, mapvariables.json, ... from site_folder) and the two endpoints above.
     regressor / tree may be left out (None): drawing-only mode. Every stroke is still saved to latest.npz,
     but /predict is refused until you restart the server with fitted models.
@@ -73,6 +74,20 @@ def run_server(regressor=None, tree=None, site_folder=".", port=8000, kernel_siz
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=site_folder, **kwargs)
 
+        def _cors(self):                                     # lets the hosted page talk to this local server
+            origin = self.headers.get("Origin")
+            if origin and origin in allowed_origins:
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Access-Control-Allow-Private-Network", "true")
+                self.send_header("Vary", "Origin")
+
+        def do_OPTIONS(self):                                # CORS preflight
+            self.send_response(204)
+            self._cors()
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.end_headers()
+
         def log_message(self, *args):                        # slider drags would flood the console
             pass
 
@@ -81,6 +96,7 @@ def run_server(regressor=None, tree=None, site_folder=".", port=8000, kernel_siz
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self._cors()
             self.end_headers()
             self.wfile.write(body)
 
