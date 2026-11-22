@@ -1,0 +1,14 @@
+{
+  "model_file": "ridge_temperature_model.joblib",
+  "kernel_size": 11,
+  "water_vector_kernel_size": 9,
+  "water_inverse_distance_power": 2,
+  "n_features": 506,
+  "feature_layout": "kernel(k*k*4: altitude, ice thickness, land fraction, ice fraction) + 12 water/ice vector columns + 8 location columns + global mean temp + CO2 ppm",
+  "split_mode": "years",
+  "holdout_every": 5,
+  "best_alpha": 3.1622776601683795,
+  "pixels_per_year": 1000,
+  "test_r2": 0.977790892124176,
+  "test_rmse_C": 2.9949447636931876
+}
