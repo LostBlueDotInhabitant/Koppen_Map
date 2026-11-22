@@ -190,11 +190,44 @@ function drawLayer(){
   if(!M)return;
   const l=LAY[+$("ly").value],a=M[l[0]];
   if(l[0]==="alt"){
-    // land (>0) beige, ocean (≤0) blue
+    // continuous modern-Earth elevation colours
     paint($("cD"),i=>{
       const v=a[i];
       if(blank(v))return null;
-      return v>0 ? [210,180,140] : [30,90,180];
+      if(v<=0){
+        // ocean: deeper → darker blue
+        const t=Math.min(1,Math.max(0,-v/6000));
+        return [
+          Math.round( 20 + 100*(1-t)),
+          Math.round( 80 + 120*(1-t)),
+          Math.round(160 +  70*(1-t))
+        ];
+      }else{
+        // land: low = pale yellow, high = orange → deep red
+        const t=Math.min(1,v/5000);
+        if(t<0.4){               // lowland → yellow
+          const u=t/0.4;
+          return [
+            Math.round(235 - 20*u),
+            Math.round(220 - 40*u),
+            Math.round(150 - 60*u)
+          ];
+        }else if(t<0.75){        // hills → orange
+          const u=(t-0.4)/0.35;
+          return [
+            Math.round(215 - 30*u),
+            Math.round(180 - 90*u),
+            Math.round( 90 - 50*u)
+          ];
+        }else{                   // mountains → red/brown
+          const u=(t-0.75)/0.25;
+          return [
+            Math.round(185 - 40*u),
+            Math.round( 90 - 50*u),
+            Math.round( 40 - 20*u)
+          ];
+        }
+      }
     });
   }else{
     paint($("cD"),i=>ramp((a[i]-l[2])/(l[3]-l[2])));
@@ -279,13 +312,28 @@ function readout2(e){if(!M)return;const[c,r]=cellOf(e),i=r*W+c;
 async function load2(){
   const st=$("s2");
   try{
-    let j=null;
-    try{const r=await fetch("mapvariables.json",{cache:"no-cache"});if(r.ok)j=await r.json();}catch(_){}
-    if(!j&&$("data"))j=JSON.parse($("data").textContent);
-    if(!j)throw new Error("mapvariables.json not found and no embedded data.");
+    let j=null, src="embedded";
+    try{
+      const r=await fetch("mapvariables.json",{cache:"no-cache"});
+      if(r.ok){
+        const cand=await r.json();
+        // only accept the file if it has all four required arrays of the right length
+        if(Array.isArray(cand.altitude)&&Array.isArray(cand.ice_thickness)&&
+           Array.isArray(cand.land_area_fraction)&&Array.isArray(cand.ice_area_fraction)&&
+           cand.altitude.length===N){
+          j=cand; src="mapvariables.json";
+        }
+      }
+    }catch(_){}
+    if(!j&&$("data")){j=JSON.parse($("data").textContent); src="embedded";}
+    if(!j)throw new Error("mapvariables.json not found / incomplete, and no embedded data.");
     BASE={alt:j.altitude,ice:j.ice_thickness,land:j.land_area_fraction,icef:j.ice_area_fraction};M={};
-    for(const k in BASE){BASE[k]=Float32Array.from(BASE[k]);M[k]=BASE[k].slice()}}
-  catch(e){st.className="status err";st.textContent=e.message;return}
+    for(const k in BASE){
+      if(!Array.isArray(BASE[k])||BASE[k].length!==N)
+        throw new Error("'"+k+"' must be a list of "+N+" numbers (from "+src+")");
+      BASE[k]=Float32Array.from(BASE[k]);M[k]=BASE[k].slice();
+    }
+  }catch(e){st.className="status err";st.textContent=e.message;return}
   setLayer();
   await backendCheck();
   if(BACKEND){setSliders(BACKEND_SLIDERS);
