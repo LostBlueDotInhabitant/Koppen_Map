@@ -5,4 +5,6 @@ and download the master zip file.
 
 After exporting zip files, use run.bat to run the app.
 
+Use setup.bat if python libraries are missing.
+
 <3
