@@ -333,7 +333,7 @@ async function load2(){
     catch(e){backendError(e)}
     return}
   try{const r=await fetch("model.json",{cache:"no-cache"});if(!r.ok)throw new Error("model.json not found (HTTP "+r.status+"), so only drawing works.");
-    MODEL=await r.json();const s=MODEL.sliders||{co2:[180,1300,420],temp:[10,22,14.5]};
+    MODEL=await r.json();const s=MODEL.sliders||{co2:[100,1300,420],temp:[4,22,14.5]};
     for(const[id,v]of[["co",s.co2],["gt",s.temp]]){const e=$(id);e.min=v[0];e.max=v[1];e.value=v[2];e.step=id==="co"?1:0.1}
     mapStatic();update();st.className="status";st.textContent="Ready. Map source: "+src+" · land/ocean split at 0 m."}
   catch(e){st.className="status err";st.textContent=e.message}}
@@ -387,7 +387,7 @@ async function runModel(){
   catch(e){st.className="status err";st.textContent=e.message}
   b.disabled=false}
 $("run").onclick=runModel;
-setSliders({co2:[180,1300,420],temp:[10,22,14.5]});   // default ranges and start values
+setSliders({co2:[100,1300,420],temp:[4,22,14.5]});   // default ranges and start values
 update();                                             // writes the values next to the sliders
 load2();
 </script>
