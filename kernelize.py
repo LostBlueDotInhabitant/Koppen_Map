@@ -1,7 +1,8 @@
 """Neighbourhood (kernel) features for the Koppen decision tree and the local-temperature regression.
 
 DATA LAYOUT
-  * On GitHub (downloaded once, then cached on disk): MapVariables.csv, koppen_historical_1900_2026.csv,
+  * On GitHub (downloaded once, then cached on disk) OR just placed in the same folder as the two temperature
+    files below: MapVariables.csv, koppen_historical_1900_2026.csv,
     co2_temperature_historical_1900_2026.csv, co2_temperature_projections_2026_2100.csv
   * On your computer (too big for GitHub): the two local-temperature files
         tas_annual_mean_1deg_wide_celsius.csv        (1900-2014, one column per year)
@@ -43,16 +44,14 @@ _DATA_SOURCES = {"github_base_url": None, "temperature_directory": None, "cache_
 # kernel_size accepts None, which means "use the value set here".
 _KERNEL_SETTINGS = {"kernel_size": 5, "water_vector_kernel_size": None, "include_water_vectors": True,
                     "inverse_distance_power": 1, "water_inverse_distance_power": 2,
-                    "scale_east_west_by_cos_latitude": False, "include_latitude": True}
+                    "scale_east_west_by_cos_latitude": False}
 
 
 # ======================= kernel configuration =======================
 def configure_kernel(kernel_size=5, water_vector_kernel_size=None, include_water_vectors=True,
                      inverse_distance_power=1, scale_east_west_by_cos_latitude=False,
-                     water_inverse_distance_power=2, include_latitude=True):
+                     water_inverse_distance_power=2):
     """Set the defaults used by every function below (each call sets ALL of them).
-    include_latitude: add one latitude column (degrees, pixel centre) to the features of both models.
-        Longitude is never included.
     kernel_size: odd integer, width/height of the neighbourhood (3, 5, 7, ...).
     water_vector_kernel_size: neighbourhood used for the water AND ice vectors; None = same as kernel_size.
         (A larger window lets the vectors 'see' water/ice further away than the kernel does.)
@@ -68,8 +67,7 @@ def configure_kernel(kernel_size=5, water_vector_kernel_size=None, include_water
                             include_water_vectors=include_water_vectors,
                             inverse_distance_power=inverse_distance_power,
                             scale_east_west_by_cos_latitude=scale_east_west_by_cos_latitude,
-                            water_inverse_distance_power=water_inverse_distance_power,
-                            include_latitude=include_latitude)
+                            water_inverse_distance_power=water_inverse_distance_power)
 
 def _resolve_kernel_size(kernel_size):
     """None -> the configured default."""
@@ -90,13 +88,20 @@ def configure_data_sources(github_base_url=None, temperature_directory=None, cac
 
 def _path_of_github_file(file_name):
     """Download file_name from the configured GitHub folder (only if not cached yet); return its local path."""
+    cached_path = os.path.join(_DATA_SOURCES["cache_directory"], file_name)
+    if os.path.exists(cached_path):
+        return cached_path
+    # also accept the file sitting in the same folder as the temperature CSVs (no GitHub needed)
+    if _DATA_SOURCES["temperature_directory"] is not None:
+        local_path = os.path.join(_DATA_SOURCES["temperature_directory"], file_name)
+        if os.path.exists(local_path):
+            return local_path
     base_url = _DATA_SOURCES["github_base_url"]
     if base_url is None:
-        raise RuntimeError("Call configure_data_sources(github_base_url=...) first.")
+        raise RuntimeError(f"{file_name} not found in '{_DATA_SOURCES['cache_directory']}' or in the temperature "
+                           "directory; put it there or call configure_data_sources(github_base_url=...).")
     os.makedirs(_DATA_SOURCES["cache_directory"], exist_ok=True)
-    cached_path = os.path.join(_DATA_SOURCES["cache_directory"], file_name)
-    if not os.path.exists(cached_path):
-        urllib.request.urlretrieve(base_url + file_name, cached_path)
+    urllib.request.urlretrieve(base_url + file_name, cached_path)
     return cached_path
 
 def _path_of_local_temperature_file(file_name):
@@ -321,10 +326,24 @@ def compute_ice_vectors_for_every_pixel(ice_fraction_grid, **options):
 
 
 # ======================= feature builders (all 64,800 pixels, for training or prediction) ==========
-def _map_features_for_every_pixel(map_variables, kernel_size, extra_channel=None):
+LOCATION_FEATURE_NAMES = ("latitude", "abs_latitude", "sin_lat", "cos_lat", "sin_lat^2", "sin_lat^3",
+                          "sin_lon", "cos_lon")
+
+def compute_location_features_for_every_pixel():
+    """Where the pixel is on the globe: (64800, 8) float32 columns, in LOCATION_FEATURE_NAMES order.
+    The kernel only sees altitude / ice / land fraction, so WITHOUT these the model cannot know a pixel's
+    latitude, which is the strongest single driver of mean temperature (held-out R2 ~0.73 -> ~0.97).
+    Longitude is given as sin/cos so that -180 and +180 are neighbours."""
+    latitude = np.repeat(np.arange(NUM_LAT_ROWS) - 89.5, NUM_LON_COLS)
+    longitude = np.tile(np.arange(NUM_LON_COLS) - 179.5, NUM_LAT_ROWS)
+    sin_lat = np.sin(np.deg2rad(latitude))
+    return np.stack([latitude, np.abs(latitude), sin_lat, np.cos(np.deg2rad(latitude)), sin_lat ** 2, sin_lat ** 3,
+                     np.sin(np.deg2rad(longitude)), np.cos(np.deg2rad(longitude))], axis=1).astype(np.float32)
+
+def _map_features_for_every_pixel(map_variables, kernel_size, extra_channel=None, include_location_features=False):
     """Time-invariant part of the features: kernel columns, then (if enabled) 12 vector columns:
     4 toward all water, 4 toward ice-free water, 4 toward ice (each set = unweighted pair + 1/d**2 pair),
-    then (if include_latitude) 1 latitude column. Longitude is never a feature.
+    then (if include_location_features) 8 latitude/longitude columns (the temperature model uses these).
     extra_channel: optional (180, 360) grid (surface temperature) appended as a 5th kernel channel."""
     kernel_size = _resolve_kernel_size(kernel_size)
     channels = map_variables if extra_channel is None else np.concatenate(
@@ -336,21 +355,20 @@ def _map_features_for_every_pixel(map_variables, kernel_size, extra_channel=None
         columns.append(compute_open_water_vectors_for_every_pixel(land_fraction, ice_fraction)
                        .reshape(NUM_PIXELS, -1))
         columns.append(compute_ice_vectors_for_every_pixel(ice_fraction).reshape(NUM_PIXELS, -1))
-    if _KERNEL_SETTINGS["include_latitude"]:
-        # one column: latitude (degrees) of each pixel centre; flattened row-major like the other columns
-        latitude_of_row = np.arange(NUM_LAT_ROWS, dtype=np.float32) - 89.5
-        columns.append(np.repeat(latitude_of_row, NUM_LON_COLS).reshape(NUM_PIXELS, 1))
-    return np.hstack(columns)
+    if include_location_features:
+        columns.append(compute_location_features_for_every_pixel())
+    return np.hstack(columns).astype(np.float32, copy=False)
 
 def make_temperature_regression_features(kernel_size, global_mean_temperature, co2_ppm, epoch="0ka",
                                          map_variables=None):
     """Features for EVERY pixel (land + ocean). kernel_size=None -> configured default.
     Columns: kernel of [altitude, ice thickness, land fraction, ice fraction] (k*k*4),
-    the 12 vector columns (if enabled: 4 all-water, 4 ice-free-water, 4 ice), then global temp, CO2.
+    the 12 vector columns (if enabled: 4 all-water, 4 ice-free-water, 4 ice), the 8 location columns
+    (latitude etc.), then global temp, CO2.
     Use epoch='21ka' (and 21 ka global temp / CO2) when predicting the past."""
     if map_variables is None:
         map_variables = load_time_invariant_map_variables(epoch)
-    kernels = _map_features_for_every_pixel(map_variables, kernel_size)
+    kernels = _map_features_for_every_pixel(map_variables, kernel_size, include_location_features=True)
     # global temp and CO2 are the same for every pixel in a given year, and sit OUTSIDE the kernel
     global_columns = np.full((NUM_PIXELS, 2), [global_mean_temperature, co2_ppm], dtype=np.float32)
     return np.hstack([kernels, global_columns])
@@ -375,12 +393,14 @@ def make_temperature_regression_training_data(kernel_size, years, global_mean_te
     pixels_per_year: if set, keep only this many RANDOM pixels from each year (different pixels every
         year, reproducible via random_seed). All 64,800 pixels x 200 years x 102 features is ~5 GB;
         5,000 per year is ~0.4 GB. Neighbouring pixels are near-duplicates, so little information is lost.
-    precomputed_kernels: optional output of _map_features_for_every_pixel, to avoid recomputing it."""
+    precomputed_kernels: optional output of _map_features_for_every_pixel(..., include_location_features=True),
+        to avoid recomputing it."""
     rng = np.random.default_rng(random_seed)
     if precomputed_kernels is None:
         map_variables = load_time_invariant_map_variables(map_epoch)
         # kernels (and vectors) of the time-invariant maps are identical every year: compute once, reuse
-        precomputed_kernels = _map_features_for_every_pixel(map_variables, kernel_size)
+        precomputed_kernels = _map_features_for_every_pixel(map_variables, kernel_size,
+                                                            include_location_features=True)
     kernels = precomputed_kernels
     X_parts, y_parts = [], []
     for year in years:
@@ -428,7 +448,8 @@ def make_temperature_regression_training_data_from_files(kernel_size=None, scena
     future_years = [y for y in years if y >= 2015]
     historical_grids, scenario_grids = load_all_local_temperature_grids(scenarios, min(years), max(years))
     # the time-invariant kernels and vectors are the same for every scenario: compute once
-    kernels = _map_features_for_every_pixel(load_time_invariant_map_variables("0ka"), kernel_size)
+    kernels = _map_features_for_every_pixel(load_time_invariant_map_variables("0ka"), kernel_size,
+                                            include_location_features=True)
     rows_per_year = NUM_PIXELS if pixels_per_year is None else pixels_per_year
     X_parts, y_parts, year_parts, scenario_parts = [], [], [], []
     for i, scenario in enumerate(scenarios):
