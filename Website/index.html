@@ -314,20 +314,24 @@ async function load2(){
   const st=$("s2");
   try{
     let j=null, src="embedded";
-    try{
-      const r=await fetch("mapvariables.json",{cache:"no-cache"});
-      if(r.ok){
-        const cand=await r.json();
-        // only accept the file if it has all four required arrays of the right length
-        if(Array.isArray(cand.altitude)&&Array.isArray(cand.ice_thickness)&&
-           Array.isArray(cand.land_area_fraction)&&Array.isArray(cand.ice_area_fraction)&&
-           cand.altitude.length===N){
-          j=cand; src="mapvariables.json";
+    // Prefer the embedded 0 ka data so an old mapvariables.json on the server cannot override it
+    if($("data")){
+      try{ j=JSON.parse($("data").textContent); src="embedded"; }catch(_){ j=null; }
+    }
+    if(!j){
+      try{
+        const r=await fetch("mapvariables.json",{cache:"no-cache"});
+        if(r.ok){
+          const cand=await r.json();
+          if(Array.isArray(cand.altitude)&&Array.isArray(cand.ice_thickness)&&
+             Array.isArray(cand.land_area_fraction)&&Array.isArray(cand.ice_area_fraction)&&
+             cand.altitude.length===N){
+            j=cand; src="mapvariables.json";
+          }
         }
-      }
-    }catch(_){}
-    if(!j&&$("data")){j=JSON.parse($("data").textContent); src="embedded";}
-    if(!j)throw new Error("mapvariables.json not found / incomplete, and no embedded data.");
+      }catch(_){}
+    }
+    if(!j)throw new Error("No embedded data and mapvariables.json missing/incomplete.");
     BASE={alt:j.altitude,ice:j.ice_thickness,land:j.land_area_fraction,icef:j.ice_area_fraction};M={};
     for(const k in BASE){
       if(!Array.isArray(BASE[k])||BASE[k].length!==N)
